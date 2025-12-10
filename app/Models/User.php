@@ -11,25 +11,46 @@ class User extends Authenticatable
 {
     use HasApiTokens, HasFactory, Notifiable;
 
+    public const STATUS_PENDING   = 'pending';
+    public const STATUS_ACTIVE    = 'active';
+    public const STATUS_BLOCKED   = 'blocked';
+    public const STATUS_SUSPENDED = 'suspended';
+
     protected $fillable = [
         'name',
-        'phone',      // 👈 مهم جداً
+        'phone',
         'email',
         'password',
-        'status',     // 👈 مهم جداً
-    ];
-
-    protected $hidden = [
-        'password',
-        'remember_token',
+        'status',
+        'phone_verified_at',
     ];
 
     protected $casts = [
-        'email_verified_at' => 'datetime',
-        'password' => 'hashed',
+        'phone_verified_at' => 'datetime',
     ];
 
-    public function wallets()
+    // Helpers
+    public function isActive(): bool
+    {
+        return $this->status === self::STATUS_ACTIVE;
+    }
+
+    public function isPending(): bool
+    {
+        return $this->status === self::STATUS_PENDING;
+    }
+
+    public function isBlocked(): bool
+    {
+        return $this->status === self::STATUS_BLOCKED;
+    }
+
+    public function isSuspended(): bool
+    {
+        return $this->status === self::STATUS_SUSPENDED;
+    }
+
+        public function wallets()
     {
         return $this->hasMany(Wallet::class);
     }

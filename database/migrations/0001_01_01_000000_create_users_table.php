@@ -17,8 +17,10 @@ Schema::create('users', function (Blueprint $table) {
     $table->string('phone')->unique();
     $table->string('email')->nullable()->unique();
     $table->timestamp('email_verified_at')->nullable();
+    $table->timestamp('phone_verified_at')->nullable();
     $table->string('password');
-    $table->enum('status', ['active', 'blocked'])->default('active');
+    $table->enum('status', ['pending', 'active', 'blocked', 'suspended'])
+      ->default('pending');
     $table->rememberToken();
     $table->timestamps();
 });
