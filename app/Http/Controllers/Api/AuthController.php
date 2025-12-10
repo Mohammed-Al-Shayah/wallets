@@ -81,4 +81,30 @@ class AuthController extends Controller
         ],
     ]);
     }
+
+    public function me(Request $request)
+{
+    $user = $request->user(); // من التوكن
+
+    return response()->json([
+        'success' => true,
+        'message' => 'User profile fetched successfully',
+        'data'    => [
+            'user' => $user,
+        ],
+    ]);
+}
+
+public function logout(Request $request)
+{
+    $user = $request->user();
+
+    $user->currentAccessToken()->delete();
+
+    return response()->json([
+        'success' => true,
+        'message' => 'Logged out successfully',
+    ]);
+}
+
 }
