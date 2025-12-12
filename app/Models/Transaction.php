@@ -3,42 +3,60 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class Transaction extends Model
 {
-    use HasFactory;
-
     protected $fillable = [
         'user_id',
-        'wallet_id_from',
-        'wallet_id_to',
-        'type',
+        'wallet_id',
+        'type',              // credit / debit
         'amount',
         'fee',
         'total_amount',
-        'currency_code',
-        'status',
-        'reference',
+        'balance_before',
+        'balance_after',
+        'status',            // pending / completed / failed
+        'reference',         // رقم مرجعي داخلي / خارجي
+        'description',
         'meta',
     ];
 
     protected $casts = [
-        'meta' => 'array',
+       'amount'          => 'float',
+       'balance_before'  => 'float',
+       'balance_after'   => 'float',
+       'meta'            => 'array',
     ];
 
-    public function user()
+     const TYPE_WITHDRAW = 'withdraw';
+
+    const STATUS_PENDING   = 'pending';
+    const STATUS_COMPLETED = 'completed';
+    const STATUS_REJECTED  = 'rejected';
+
+    public function scopeWithdraw($query)
     {
-        return $this->belongsTo(User::class);
+        return $query->where('type', self::TYPE_WITHDRAW);
     }
 
-    public function fromWallet()
+    public function isPending(): bool
     {
-        return $this->belongsTo(Wallet::class, 'wallet_id_from');
+        return $this->status === self::STATUS_PENDING;
     }
 
-    public function toWallet()
+    public function isWithdraw(): bool
     {
-        return $this->belongsTo(Wallet::class, 'wallet_id_to');
+        return $this->type === self::TYPE_WITHDRAW;
+    }
+
+    public const TYPE_CREDIT   = 'credit';
+    public const TYPE_DEBIT    = 'debit';
+
+    public const STATUS_FAILED    = 'failed';
+
+    public function wallet(): BelongsTo
+    {
+        return $this->belongsTo(Wallet::class);
     }
 }

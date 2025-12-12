@@ -2,78 +2,151 @@
 
 namespace App\Services;
 
-use App\Models\Transaction;
 use App\Models\User;
 use App\Models\Wallet;
+use App\Models\Transaction;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
 class WalletService
 {
-    public function transferInternal(User $sender, string $toPhone, float $amount, string $currency): Transaction
+    public function getOrCreateUserMainWallet(User $user): Wallet
+    {
+        return Wallet::firstOrCreate(
+            [
+                'user_id' => $user->id,
+                'type'    => Wallet::TYPE_MAIN,
+            ],
+            [
+                'balance' => 0,
+                'currency'=> 'QRA', // عدّلها لو بدك SAR أو غيره
+                'status'  => Wallet::STATUS_ACTIVE,
+            ]
+        );
+    }
+
+    /**
+     * إيداع داخلي (مثلاً bonus / شحن تجريبي)
+     */
+    public function credit(Wallet $wallet, float $amount, string $description = null, array $meta = []): Transaction
     {
         if ($amount <= 0) {
             throw ValidationException::withMessages([
-                'amount' => 'Amount must be greater than zero.',
+                'amount' => ['Amount must be greater than zero.'],
             ]);
         }
 
-        return DB::transaction(function () use ($sender, $toPhone, $amount, $currency) {
-            $currency = strtoupper($currency);
+        return DB::transaction(function () use ($wallet, $amount, $description, $meta) {
+            $wallet->refresh();
 
-            // 1) sender wallet
-            $fromWallet = Wallet::where('user_id', $sender->id)
-                ->where('currency_code', $currency)
-                ->lockForUpdate()
-                ->firstOrFail();
+            $before = $wallet->balance;
+            $after  = $wallet->balance + $amount;
 
-            if ($fromWallet->balance < $amount) {
-                throw ValidationException::withMessages([
-                    'balance' => 'Insufficient balance.',
-                ]);
-            }
+            $wallet->balance = $after;
+            $wallet->save();
 
-            // 2) receiver
-            $receiver = User::where('phone', $toPhone)->firstOrFail();
-
-            $toWallet = Wallet::firstOrCreate(
-                [
-                    'user_id'       => $receiver->id,
-                    'currency_code' => $currency,
-                ],
-                [
-                    'balance' => 0,
-                    'status'  => 'active',
-                ]
-            );
-
-            $toWallet->refresh();
-            $toWallet->lockForUpdate();
-
-            // 3) update balances
-            $fromWallet->balance -= $amount;
-            $fromWallet->save();
-
-            $toWallet->balance += $amount;
-            $toWallet->save();
-
-            // 4) transaction record
             return Transaction::create([
-                'user_id'        => $sender->id,
-                'wallet_id_from' => $fromWallet->id,
-                'wallet_id_to'   => $toWallet->id,
-                'type'           => 'transfer',
+                'user_id'        => $wallet->user_id,
+                'wallet_id'      => $wallet->id,
+                'type'           => Transaction::TYPE_CREDIT,
                 'amount'         => $amount,
                 'fee'            => 0,
                 'total_amount'   => $amount,
-                'currency_code'  => $currency,
-                'status'         => 'success',
-                'reference'      => null,
-                'meta'           => [
-                    'to_phone'  => $toPhone,
-                    'direction' => 'internal_transfer',
-                ],
+                'balance_before' => $before,
+                'balance_after'  => $after,
+                'status'         => Transaction::STATUS_COMPLETED,
+                'description'    => $description,
+                'reference'      => $meta['reference'] ?? null,
+                'meta'           => $meta,
             ]);
+        });
+    }
+
+    /**
+     * خصم داخلي
+     */
+    public function debit(Wallet $wallet, float $amount, string $description = null, array $meta = []): Transaction
+    {
+        if ($amount <= 0) {
+            throw ValidationException::withMessages([
+                'amount' => ['Amount must be greater than zero.'],
+            ]);
+        }
+
+        return DB::transaction(function () use ($wallet, $amount, $description, $meta) {
+            $wallet->refresh();
+
+            if ($wallet->balance < $amount) {
+                throw ValidationException::withMessages([
+                    'balance' => ['Insufficient balance.'],
+                ]);
+            }
+
+            $before = $wallet->balance;
+            $after  = $wallet->balance - $amount;
+
+            $wallet->balance = $after;
+            $wallet->save();
+
+            return Transaction::create([
+                'user_id'        => $wallet->user_id,
+                'wallet_id'      => $wallet->id,
+                'type'           => Transaction::TYPE_DEBIT,
+                'amount'         => $amount,
+                'fee'            => 0,
+                'total_amount'   => $amount,
+                'balance_before' => $before,
+                'balance_after'  => $after,
+                'status'         => Transaction::STATUS_COMPLETED,
+                'description'    => $description,
+                'reference'      => $meta['reference'] ?? null,
+                'meta'           => $meta,
+            ]);
+        });
+    }
+
+    /**
+     * تحويل من يوزر ليوزر (داخلي)
+     */
+    public function transfer(User $fromUser, User $toUser, float $amount, ?string $note = null): array
+    {
+        if ($fromUser->id === $toUser->id) {
+            throw ValidationException::withMessages([
+                'to_user' => ['Cannot transfer to the same user.'],
+            ]);
+        }
+
+        $fromWallet = $this->getOrCreateUserMainWallet($fromUser);
+        $toWallet   = $this->getOrCreateUserMainWallet($toUser);
+
+        return DB::transaction(function () use ($fromWallet, $toWallet, $amount, $note, $fromUser, $toUser) {
+            $reference = 'TRF-' . now()->timestamp . '-' . $fromUser->id . '-' . $toUser->id;
+
+            $debitTx = $this->debit(
+                wallet: $fromWallet,
+                amount: $amount,
+                description: 'Transfer to ' . $toUser->phone,
+                meta: [
+                    'direction' => 'outgoing',
+                    'to_user_id' => $toUser->id,
+                    'reference' => $reference,
+                    'note'      => $note,
+                ],
+            );
+
+            $creditTx = $this->credit(
+                wallet: $toWallet,
+                amount: $amount,
+                description: 'Transfer from ' . $fromUser->phone,
+                meta: [
+                    'direction' => 'incoming',
+                    'from_user_id' => $fromUser->id,
+                    'reference'    => $reference,
+                    'note'         => $note,
+                ],
+            );
+
+            return [$debitTx, $creditTx];
         });
     }
 }

@@ -3,31 +3,36 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Wallet extends Model
 {
-    use HasFactory;
-
     protected $fillable = [
         'user_id',
-        'currency_code',
         'balance',
+        'currency',
         'status',
+        'type',
     ];
 
-    public function user()
+    protected $casts = [
+        'balance' => 'float',
+    ];
+
+    public const STATUS_ACTIVE   = 'active';
+    public const STATUS_BLOCKED  = 'blocked';
+
+    public const TYPE_MAIN       = 'main';
+    public const TYPE_BONUS      = 'bonus';
+
+    public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
     }
 
-    public function outgoingTransactions()
+    public function transactions(): HasMany
     {
-        return $this->hasMany(Transaction::class, 'wallet_id_from');
-    }
-
-    public function incomingTransactions()
-    {
-        return $this->hasMany(Transaction::class, 'wallet_id_to');
+        return $this->hasMany(Transaction::class);
     }
 }
