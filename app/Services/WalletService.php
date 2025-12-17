@@ -10,19 +10,55 @@ use Illuminate\Validation\ValidationException;
 
 class WalletService
 {
-    public function getOrCreateUserMainWallet(User $user): Wallet
+    public function getOrCreateUserMainWallet(User $user, ?string $currency = null): Wallet
     {
-        return Wallet::firstOrCreate(
-            [
-                'user_id' => $user->id,
-                'type'    => Wallet::TYPE_MAIN,
-            ],
-            [
-                'balance' => 0,
-                'currency'=> 'QRA', // عدّلها لو بدك SAR أو غيره
-                'status'  => Wallet::STATUS_ACTIVE,
-            ]
-        );
+        $desiredCurrency = $currency ?: config('wallet.default_currency', 'QRA');
+
+        return $this->createWallet($user, $desiredCurrency, Wallet::TYPE_MAIN, failIfExists: false);
+    }
+
+    public function createWallet(User $user, string $currency, string $type = Wallet::TYPE_MAIN, bool $failIfExists = true): Wallet
+    {
+        $normalizedCurrency = strtoupper($currency);
+        $this->assertCurrencySupported($normalizedCurrency);
+
+        $existing = Wallet::where('user_id', $user->id)
+            ->where('currency', $normalizedCurrency)
+            ->where('type', $type)
+            ->first();
+
+        if ($existing) {
+            if ($failIfExists) {
+                throw ValidationException::withMessages([
+                    'currency' => ['Wallet with this currency already exists for this user.'],
+                ]);
+            }
+
+            return $existing;
+        }
+
+        return Wallet::create([
+            'user_id' => $user->id,
+            'type'    => $type,
+            'currency'=> $normalizedCurrency,
+            'balance' => 0,
+            'status'  => Wallet::STATUS_ACTIVE,
+        ]);
+    }
+
+    public function getUserWalletOrFail(User $user, int $walletId): Wallet
+    {
+        $wallet = Wallet::where('id', $walletId)
+            ->where('user_id', $user->id)
+            ->first();
+
+        if (! $wallet) {
+            throw ValidationException::withMessages([
+                'wallet_id' => ['Wallet not found for this user.'],
+            ]);
+        }
+
+        return $wallet;
     }
 
     /**
@@ -108,27 +144,30 @@ class WalletService
     /**
      * تحويل من يوزر ليوزر (داخلي)
      */
-    public function transfer(User $fromUser, User $toUser, float $amount, ?string $note = null): array
+    public function transfer(Wallet $fromWallet, Wallet $toWallet, float $amount, ?string $note = null): array
     {
-        if ($fromUser->id === $toUser->id) {
+        if ($fromWallet->user_id === $toWallet->user_id && $fromWallet->id === $toWallet->id) {
             throw ValidationException::withMessages([
-                'to_user' => ['Cannot transfer to the same user.'],
+                'wallet' => ['Cannot transfer to the same wallet.'],
             ]);
         }
 
-        $fromWallet = $this->getOrCreateUserMainWallet($fromUser);
-        $toWallet   = $this->getOrCreateUserMainWallet($toUser);
+        if ($fromWallet->currency !== $toWallet->currency) {
+            throw ValidationException::withMessages([
+                'currency' => ['Transfer wallets must share the same currency.'],
+            ]);
+        }
 
-        return DB::transaction(function () use ($fromWallet, $toWallet, $amount, $note, $fromUser, $toUser) {
-            $reference = 'TRF-' . now()->timestamp . '-' . $fromUser->id . '-' . $toUser->id;
+        return DB::transaction(function () use ($fromWallet, $toWallet, $amount, $note) {
+            $reference = 'TRF-' . now()->timestamp . '-' . $fromWallet->user_id . '-' . $toWallet->user_id;
 
             $debitTx = $this->debit(
                 wallet: $fromWallet,
                 amount: $amount,
-                description: 'Transfer to ' . $toUser->phone,
+                description: 'Transfer to wallet #' . $toWallet->id,
                 meta: [
                     'direction' => 'outgoing',
-                    'to_user_id' => $toUser->id,
+                    'to_user_id' => $toWallet->user_id,
                     'reference' => $reference,
                     'note'      => $note,
                 ],
@@ -137,10 +176,10 @@ class WalletService
             $creditTx = $this->credit(
                 wallet: $toWallet,
                 amount: $amount,
-                description: 'Transfer from ' . $fromUser->phone,
+                description: 'Transfer from wallet #' . $fromWallet->id,
                 meta: [
                     'direction' => 'incoming',
-                    'from_user_id' => $fromUser->id,
+                    'from_user_id' => $fromWallet->user_id,
                     'reference'    => $reference,
                     'note'         => $note,
                 ],
@@ -148,5 +187,16 @@ class WalletService
 
             return [$debitTx, $creditTx];
         });
+    }
+
+    protected function assertCurrencySupported(string $currency): void
+    {
+        $supported = config('wallet.supported_currencies', []);
+
+        if (! in_array($currency, $supported, true)) {
+            throw ValidationException::withMessages([
+                'currency' => ['Unsupported currency.'],
+            ]);
+        }
     }
 }

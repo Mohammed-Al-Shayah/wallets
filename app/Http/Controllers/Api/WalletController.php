@@ -12,6 +12,7 @@ use App\Models\User;
 use App\Services\WalletService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\ValidationException;
+use Illuminate\Validation\Rule;
 
 class WalletController extends BaseApiController
 {
@@ -27,17 +28,82 @@ class WalletController extends BaseApiController
     public function summary(Request $request)
     {
         $user   = $request->user();
-        $wallet = $this->walletService->getOrCreateUserMainWallet($user);
+        $defaultWallet = $this->walletService->getOrCreateUserMainWallet($user);
+
+        $walletsQuery = $user->wallets()->orderBy('id');
+
+        if ($request->query('currency')) {
+            $walletsQuery->where('currency', strtoupper($request->query('currency')));
+        }
+
+        $wallets = $walletsQuery->get();
 
         return $this->success(
             message: 'Wallet summary.',
             code: 'WALLET_SUMMARY',
             data: [
-                'balance'  => $wallet->balance,
-                'currency' => $wallet->currency,
-                'status'   => $wallet->status,
-                'type'     => $wallet->type,
+                'wallets'           => $wallets,
+                'default_wallet_id' => $defaultWallet->id,
             ],
+        );
+    }
+
+    /**
+     * GET /wallets/{wallet}
+     * تفاصيل محفظة واحدة
+     */
+    public function show(Request $request, Wallet $wallet)
+    {
+        if ($wallet->user_id !== $request->user()->id) {
+            return $this->error(
+                message: 'Wallet not found.',
+                code: 'WALLET_NOT_FOUND',
+                status: 404,
+            );
+        }
+
+        return $this->success(
+            message: 'Wallet details.',
+            code: 'WALLET_DETAIL',
+            data: $wallet,
+        );
+    }
+
+    /**
+     * POST /wallets
+     * إنشاء محفظة جديدة بعملة معينة
+     */
+    public function create(Request $request)
+    {
+        $data = $request->validate([
+            'currency' => ['required', 'string', Rule::in(config('wallet.supported_currencies', []))],
+            'type'     => ['nullable', 'string', Rule::in([Wallet::TYPE_MAIN, Wallet::TYPE_BONUS])],
+        ]);
+
+        $user = $request->user();
+        $type = $data['type'] ?? Wallet::TYPE_MAIN;
+
+        try {
+            $wallet = $this->walletService->createWallet(
+                user: $user,
+                currency: $data['currency'],
+                type: $type,
+                failIfExists: true,
+            );
+        } catch (ValidationException $e) {
+            return $this->error(
+                message: 'Wallet creation failed.',
+                code: 'WALLET_CREATE_FAILED',
+                status: 422,
+                errors: $e->errors(),
+            );
+        }
+
+        return $this->success(
+            message: 'Wallet created.',
+            code: 'WALLET_CREATED',
+            data: $wallet,
+            status: 201,
         );
     }
 
@@ -46,8 +112,14 @@ class WalletController extends BaseApiController
      */
     public function transactions(Request $request)
     {
+        $data = $request->validate([
+            'wallet_id' => ['nullable', 'integer', 'exists:wallets,id'],
+        ]);
+
         $user   = $request->user();
-        $wallet = $this->walletService->getOrCreateUserMainWallet($user);
+        $wallet = isset($data['wallet_id'])
+            ? $this->walletService->getUserWalletOrFail($user, (int) $data['wallet_id'])
+            : $this->walletService->getOrCreateUserMainWallet($user);
 
         $transactions = $wallet->transactions()
             ->orderByDesc('id')
@@ -56,7 +128,10 @@ class WalletController extends BaseApiController
         return $this->success(
             message: 'Wallet transactions.',
             code: 'WALLET_TRANSACTIONS',
-            data: $transactions,
+            data: [
+                'wallet'        => $wallet,
+                'transactions'  => $transactions,
+            ],
         );
     }
 
@@ -67,6 +142,7 @@ class WalletController extends BaseApiController
     public function transfer(Request $request)
     {
         $data = $request->validate([
+            'from_wallet_id' => ['nullable', 'integer', 'exists:wallets,id'],
             'to_phone' => ['required', 'string', 'exists:users,phone'],
             'amount'   => ['required', 'numeric', 'min:0.01'],
             'note'     => ['nullable', 'string', 'max:255'],
@@ -74,6 +150,9 @@ class WalletController extends BaseApiController
 
         /** @var User $fromUser */
         $fromUser = $request->user();
+        $fromWallet = isset($data['from_wallet_id'])
+            ? $this->walletService->getUserWalletOrFail($fromUser, (int) $data['from_wallet_id'])
+            : $this->walletService->getOrCreateUserMainWallet($fromUser);
         $toUser   = User::where('phone', $data['to_phone'])->first();
 
         if (! $toUser) {
@@ -86,8 +165,8 @@ class WalletController extends BaseApiController
 
         try {
             [$debitTx, $creditTx] = $this->walletService->transfer(
-                fromUser: $fromUser,
-                toUser: $toUser,
+                fromWallet: $fromWallet,
+                toWallet: $this->walletService->getOrCreateUserMainWallet($toUser, $fromWallet->currency),
                 amount: (float) $data['amount'],
                 note: $data['note'] ?? null,
             );
@@ -119,10 +198,13 @@ class WalletController extends BaseApiController
     {
         $data = $request->validate([
             'amount' => ['required', 'numeric', 'min:0.01'],
+            'wallet_id' => ['nullable', 'integer', 'exists:wallets,id'],
         ]);
 
         $user   = $request->user();
-        $wallet = $this->walletService->getOrCreateUserMainWallet($user);
+        $wallet = isset($data['wallet_id'])
+            ? $this->walletService->getUserWalletOrFail($user, (int) $data['wallet_id'])
+            : $this->walletService->getOrCreateUserMainWallet($user);
 
         $tx = $this->walletService->credit(
             wallet: $wallet,
@@ -190,9 +272,15 @@ class WalletController extends BaseApiController
 
  public function myWithdrawRequests(Request $request)
     {
+        $data = $request->validate([
+            'wallet_id' => ['nullable', 'integer', 'exists:wallets,id'],
+        ]);
+
         $user = $request->user();
 
-        $wallet = $user->wallets()->firstOrFail(); // أو حسب علاقتك الحالية
+        $wallet = isset($data['wallet_id'])
+            ? $this->walletService->getUserWalletOrFail($user, (int) $data['wallet_id'])
+            : $this->walletService->getOrCreateUserMainWallet($user);
 
         $transactions = Transaction::query()
             ->where('wallet_id', $wallet->id)
@@ -212,14 +300,13 @@ class WalletController extends BaseApiController
 {
     $user = $request->user();
 
-    // من الأفضل ربطها بالمحفظة الخاصة باليوزر عشان الأمان
-    $wallet = $user->wallets()->firstOrFail(); // عدّل لو عندك أكتر من محفظة
-
     /** @var Transaction|null $tx */
     $tx = Transaction::query()
         ->where('id', $id)
-        ->where('wallet_id', $wallet->id)
         ->where('type', 'withdraw')
+        ->whereHas('wallet', function ($query) use ($user) {
+            $query->where('user_id', $user->id);
+        })
         ->first();
 
     if (! $tx) {

@@ -28,6 +28,8 @@ Route::prefix('v1')->group(function () {
 
     // Wallet Summary
     Route::get('wallets',               [WalletController::class, 'summary']);
+    Route::get('wallets/{wallet}',      [WalletController::class, 'show']);
+    Route::post('wallets',              [WalletController::class, 'create']);
 
     // Wallet actions
     Route::post('wallets/transfer',     [WalletController::class, 'transfer']);
