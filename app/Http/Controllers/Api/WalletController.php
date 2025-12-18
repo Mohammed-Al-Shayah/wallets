@@ -11,14 +11,180 @@ use App\Http\Controllers\Api\BaseApiController;
 use App\Models\User;
 use App\Services\WalletService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Validation\Rule;
+use Illuminate\Support\Str;
 
 class WalletController extends BaseApiController
 {
     public function __construct(
         protected WalletService $walletService,
     ) {
+    }
+
+    /**
+     * POST /wallets/top-up/quote
+     */
+    public function topUpQuote(Request $request)
+    {
+        $data = $request->validate([
+            'wallet_id' => ['nullable', 'integer', 'exists:wallets,id'],
+            'amount'    => ['required', 'numeric', 'min:0.01'],
+        ]);
+
+        $user = $request->user();
+        $wallet = isset($data['wallet_id'])
+            ? $this->walletService->getUserWalletOrFail($user, (int) $data['wallet_id'])
+            : $this->walletService->getOrCreateUserMainWallet($user);
+
+        $amount = (float) $data['amount'];
+        $fee    = $this->calculateTopUpFee($amount);
+
+        return $this->success(
+            message: 'Top-up quote.',
+            code: 'TOPUP_QUOTE',
+            data: [
+                'wallet_id' => $wallet->id,
+                'currency'  => $wallet->currency,
+                'amount'    => $amount,
+                'fee'       => $fee,
+                'total'     => $amount + $fee,
+                'limits'    => [
+                    'min' => 0.01,
+                    'max' => null,
+                ],
+            ],
+        );
+    }
+
+    /**
+     * POST /wallets/top-up
+     */
+    public function topUp(Request $request)
+    {
+        $data = $request->validate([
+            'wallet_id' => ['nullable', 'integer', 'exists:wallets,id'],
+            'amount'    => ['required', 'numeric', 'min:0.01'],
+            'note'      => ['nullable', 'string', 'max:255'],
+        ]);
+
+        $user = $request->user();
+        $wallet = isset($data['wallet_id'])
+            ? $this->walletService->getUserWalletOrFail($user, (int) $data['wallet_id'])
+            : $this->walletService->getOrCreateUserMainWallet($user);
+
+        $amount = (float) $data['amount'];
+        $fee    = $this->calculateTopUpFee($amount);
+        $total  = $amount + $fee;
+
+        $reference = 'TPU-' . now()->timestamp . '-' . $wallet->id . '-' . Str::random(6);
+
+        $transaction = Transaction::create([
+            'user_id'        => $user->id,
+            'wallet_id'      => $wallet->id,
+            'type'           => Transaction::TYPE_CREDIT,
+            'amount'         => $amount,
+            'fee'            => $fee,
+            'total_amount'   => $total,
+            'balance_before' => $wallet->balance,
+            'balance_after'  => $wallet->balance,
+            'status'         => Transaction::STATUS_PENDING,
+            'reference'      => $reference,
+            'description'    => 'Top-up initiation',
+            'meta'           => [
+                'source' => 'card_topup',
+                'note'   => $data['note'] ?? null,
+            ],
+        ]);
+
+        $paymentUrl = rtrim(config('wallet.topup_payment_url'), '/') . '?reference=' . urlencode($reference);
+
+        return $this->success(
+            message: 'Top-up initiated. Redirect to payment gateway.',
+            code: 'TOPUP_INITIATED',
+            data: [
+                'wallet'       => $wallet,
+                'transaction'  => $transaction,
+                'payment_url'  => $paymentUrl,
+            ],
+            status: 201,
+        );
+    }
+
+    /**
+     * Webhook from payment gateway to confirm top-up.
+     */
+    public function topUpWebhook(Request $request)
+    {
+        $token = $request->header('X-Webhook-Token');
+        if ($token !== config('wallet.topup_webhook_token')) {
+            return response()->json([
+                'status'  => false,
+                'message' => 'Invalid webhook token.',
+            ], 403);
+        }
+
+        $data = $request->validate([
+            'reference' => ['required', 'string'],
+            'status'    => ['required', Rule::in(['success', 'failed'])],
+        ]);
+
+        /** @var Transaction|null $transaction */
+        $transaction = Transaction::query()
+            ->where('reference', $data['reference'])
+            ->where('type', Transaction::TYPE_CREDIT)
+            ->first();
+
+        if (! $transaction) {
+            return response()->json([
+                'status'  => false,
+                'message' => 'Transaction not found.',
+            ], 404);
+        }
+
+        if ($transaction->status !== Transaction::STATUS_PENDING) {
+            return response()->json([
+                'status'  => true,
+                'message' => 'Transaction already processed.',
+                'data'    => $transaction,
+            ]);
+        }
+
+        if ($data['status'] === 'failed') {
+            $transaction->status = Transaction::STATUS_FAILED;
+            $transaction->description = 'Top-up failed';
+            $transaction->meta = array_merge($transaction->meta ?? [], ['webhook_status' => 'failed']);
+            $transaction->save();
+
+            return response()->json([
+                'status'  => true,
+                'message' => 'Top-up marked as failed.',
+                'data'    => $transaction,
+            ]);
+        }
+
+        DB::transaction(function () use ($transaction) {
+            $wallet = $transaction->wallet()->lockForUpdate()->first();
+
+            $before = $wallet->balance;
+            $after  = $before + $transaction->amount;
+
+            $wallet->balance = $after;
+            $wallet->save();
+
+            $transaction->status = Transaction::STATUS_COMPLETED;
+            $transaction->balance_before = $before;
+            $transaction->balance_after  = $after;
+            $transaction->description = 'Top-up successful';
+            $transaction->meta = array_merge($transaction->meta ?? [], ['webhook_status' => 'success']);
+            $transaction->save();
+        });
+
+        return response()->json([
+            'status'  => true,
+            'message' => 'Top-up completed.',
+        ]);
     }
 
     /**
@@ -38,12 +204,146 @@ class WalletController extends BaseApiController
 
         $wallets = $walletsQuery->get();
 
+        $currencyNames = [
+            'USD' => 'US Dollar',
+            'ILS' => 'Israeli Shekel',
+            'QAR' => 'Qatari Riyal',
+            'EUR' => 'Euro',
+            'JOD' => 'Jordanian Dinar',
+            'EGP' => 'Egyptian Pound',
+        ];
+
+        foreach ($wallets as $wallet) {
+            $code = strtoupper($wallet->currency);
+            $wallet->currency_name = $currencyNames[$code] ?? $code;
+        }
+
+        $targetCurrency = 'USD';
+        $walletCurrencies = $wallets
+            ->pluck('currency')
+            ->map(fn ($currency) => strtoupper($currency))
+            ->unique()
+            ->values();
+
+        $lookupCurrencies = $walletCurrencies
+            ->filter(fn ($currency) => $currency !== $targetCurrency)
+            ->values();
+
+        $directRates = DB::table('exchange_rates')
+            ->where('to_currency', $targetCurrency)
+            ->whereIn('from_currency', $lookupCurrencies)
+            ->get()
+            ->keyBy('from_currency');
+
+        $inverseRates = DB::table('exchange_rates')
+            ->where('from_currency', $targetCurrency)
+            ->whereIn('to_currency', $lookupCurrencies)
+            ->get()
+            ->keyBy('to_currency');
+
+        $totalBalanceUsd = 0.0;
+        $missingCurrencies = [];
+
+        foreach ($wallets as $wallet) {
+            $currency = strtoupper($wallet->currency);
+
+            if ($currency === $targetCurrency) {
+                $rate = 1.0;
+            } elseif ($directRates->has($currency)) {
+                $rate = (float) $directRates->get($currency)->rate;
+            } elseif ($inverseRates->has($currency)) {
+                $inverseRate = (float) $inverseRates->get($currency)->rate;
+                $rate = $inverseRate > 0 ? 1 / $inverseRate : null;
+            } else {
+                $rate = null;
+            }
+
+            if ($rate === null) {
+                $missingCurrencies[] = $currency;
+                continue;
+            }
+
+            $totalBalanceUsd += (float) $wallet->balance * $rate;
+        }
+
+        if (! empty($missingCurrencies)) {
+            $missingCurrencies = array_values(array_unique($missingCurrencies));
+
+            return $this->error(
+                message: 'Missing exchange rates for some currencies.',
+                code: 'EXCHANGE_RATE_MISSING',
+                status: 422,
+                errors: ['currencies' => $missingCurrencies],
+            );
+        }
+
+        $walletIds = $wallets->pluck('id')->all();
+        $monthStart = now()->startOfMonth();
+        $monthlyTransfersUsd = 0.0;
+
+        if (! empty($walletIds)) {
+            $lastIncomingSub = DB::table('transactions')
+                ->select('wallet_id', DB::raw('MAX(id) as last_id'))
+                ->where('transactions.user_id', $user->id)
+                ->whereIn('transactions.wallet_id', $walletIds)
+                ->where('transactions.reference', 'like', 'TRF-%')
+                ->where('transactions.type', 'credit')
+                ->where('transactions.meta->direction', 'incoming')
+                ->groupBy('wallet_id');
+
+            $lastIncomingTransfers = DB::table('transactions as t')
+                ->joinSub($lastIncomingSub, 'li', function ($join) {
+                    $join->on('t.id', '=', 'li.last_id');
+                })
+                ->select('t.id', 't.wallet_id', 't.amount', 't.reference', 't.description', 't.created_at')
+                ->get()
+                ->keyBy('wallet_id');
+
+            foreach ($wallets as $wallet) {
+                $wallet->last_incoming_transfer = $lastIncomingTransfers->get($wallet->id);
+            }
+
+            $transferTotals = DB::table('transactions')
+                ->join('wallets', 'transactions.wallet_id', '=', 'wallets.id')
+                ->where('transactions.user_id', $user->id)
+                ->whereIn('transactions.wallet_id', $walletIds)
+                ->where('transactions.reference', 'like', 'TRF-%')
+                ->where('transactions.created_at', '>=', $monthStart)
+                ->select('wallets.currency', DB::raw('SUM(transactions.amount) as total_amount'))
+                ->groupBy('wallets.currency')
+                ->get();
+
+            foreach ($transferTotals as $row) {
+                $currency = strtoupper($row->currency);
+                $amount = (float) $row->total_amount;
+
+                if ($currency === $targetCurrency) {
+                    $rate = 1.0;
+                } elseif ($directRates->has($currency)) {
+                    $rate = (float) $directRates->get($currency)->rate;
+                } elseif ($inverseRates->has($currency)) {
+                    $inverseRate = (float) $inverseRates->get($currency)->rate;
+                    $rate = $inverseRate > 0 ? 1 / $inverseRate : null;
+                } else {
+                    $rate = null;
+                }
+
+                if ($rate === null) {
+                    continue;
+                }
+
+                $monthlyTransfersUsd += $amount * $rate;
+            }
+        }
+
         return $this->success(
             message: 'Wallet summary.',
             code: 'WALLET_SUMMARY',
             data: [
                 'wallets'           => $wallets,
                 'default_wallet_id' => $defaultWallet->id,
+                'total_balance_usd' => $totalBalanceUsd,
+                'monthly_transfers_usd' => $monthlyTransfersUsd,
             ],
         );
     }
@@ -77,7 +377,7 @@ class WalletController extends BaseApiController
     {
         $data = $request->validate([
             'currency' => ['required', 'string', Rule::in(config('wallet.supported_currencies', []))],
-            'type'     => ['nullable', 'string', Rule::in([Wallet::TYPE_MAIN, Wallet::TYPE_BONUS])],
+            'type'     => ['nullable', 'string', Rule::in([Wallet::TYPE_MAIN, Wallet::TYPE_BONUS, Wallet::TYPE_SAVING])],
         ]);
 
         $user = $request->user();
@@ -336,5 +636,15 @@ class WalletController extends BaseApiController
         'data'    => $tx,
     ]);
 }
+
+    private function calculateTopUpFee(float $amount): float
+    {
+        $percent = (float) config('wallet.topup_fee_percent', 0);
+        $flat    = (float) config('wallet.topup_fee_flat', 0);
+
+        $fee = ($percent / 100) * $amount + $flat;
+
+        return round($fee, 2);
+    }
 
 }

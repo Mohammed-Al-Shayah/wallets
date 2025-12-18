@@ -12,7 +12,7 @@ class WalletService
 {
     public function getOrCreateUserMainWallet(User $user, ?string $currency = null): Wallet
     {
-        $desiredCurrency = $currency ?: config('wallet.default_currency', 'QRA');
+        $desiredCurrency = $currency ?: config('wallet.default_currency', 'QAR');
 
         return $this->createWallet($user, $desiredCurrency, Wallet::TYPE_MAIN, failIfExists: false);
     }

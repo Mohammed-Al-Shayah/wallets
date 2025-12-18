@@ -25,6 +25,7 @@ class Wallet extends Model
 
     public const TYPE_MAIN       = 'main';
     public const TYPE_BONUS      = 'bonus';
+    public const TYPE_SAVING     = 'saving';
 
     public function user(): BelongsTo
     {

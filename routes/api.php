@@ -6,6 +6,9 @@ use App\Http\Controllers\Api\WalletController;
 
 Route::prefix('v1')->group(function () {
 
+    // Payment gateway webhook (no auth, protected by token header)
+    Route::post('wallets/top-up/webhook', [WalletController::class, 'topUpWebhook']);
+
     // ---------------- Auth Public ----------------
     Route::post('auth/register',       [AuthController::class, 'register']);
     Route::post('auth/login',          [AuthController::class, 'login']);
@@ -28,11 +31,12 @@ Route::prefix('v1')->group(function () {
 
     // Wallet Summary
     Route::get('wallets',               [WalletController::class, 'summary']);
-    Route::get('wallets/{wallet}',      [WalletController::class, 'show']);
+    Route::get('wallets/{wallet}',      [WalletController::class, 'show'])->whereNumber('wallet');
     Route::post('wallets',              [WalletController::class, 'create']);
 
     // Wallet actions
     Route::post('wallets/transfer',     [WalletController::class, 'transfer']);
+    Route::post('wallets/top-up/quote', [WalletController::class, 'topUpQuote']);
     Route::post('wallets/top-up',       [WalletController::class, 'topUp']);
     Route::post('wallets/withdraw',     [WalletController::class, 'withdraw']);
 

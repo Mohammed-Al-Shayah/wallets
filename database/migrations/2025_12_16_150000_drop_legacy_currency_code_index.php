@@ -32,7 +32,7 @@ return new class extends Migration
     {
         Schema::table('wallets', function (Blueprint $table) {
             if (! Schema::hasColumn('wallets', 'currency_code')) {
-                $table->string('currency_code', 3)->default('QRA')->after('user_id');
+                $table->string('currency_code', 3)->default('QAR')->after('user_id');
                 $table->unique(['user_id', 'currency_code'], 'wallets_user_id_currency_code_unique');
             }
         });

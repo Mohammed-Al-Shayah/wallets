@@ -16,7 +16,7 @@ return new class extends Migration
 
             // Add currency column to match model/service expectations
             if (! Schema::hasColumn('wallets', 'currency')) {
-                $table->string('currency', 3)->default('QRA')->after('type');
+                $table->string('currency', 3)->default('QAR')->after('type');
             }
         });
     }
